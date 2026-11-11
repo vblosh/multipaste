@@ -135,51 +135,56 @@ void capture()
         return;
     }
     ownSequence = 0;
-    // Prefer an image when a copy operation also advertises descriptive text.
-    UINT format = IsClipboardFormatAvailable(CF_DIBV5)                 ? CF_DIBV5
-                  : IsClipboardFormatAvailable(CF_DIB)                 ? CF_DIB
-                  : pngFormat && IsClipboardFormatAvailable(pngFormat) ? pngFormat
-                                                                       : CF_UNICODETEXT;
-    HANDLE data = GetClipboardData(format);
     auto entry = std::make_shared<Entry>();
-    entry->format = format;
-    if (data)
+    // Try each representation in order; a large or unavailable bitmap must not
+    // hide a smaller PNG offered by the same clipboard copy.
+    const UINT formats[] = {CF_DIBV5, CF_DIB, pngFormat, CF_UNICODETEXT};
+    for (UINT format : formats)
     {
-        size_t bytes = GlobalSize(data);
-        const size_t limit = format == CF_UNICODETEXT ? 256 * 1024 : ImageLimit;
-        if (bytes && bytes <= limit)
+        if (!format || !IsClipboardFormatAvailable(format))
+            continue;
+        entry->format = format;
+        HANDLE data = GetClipboardData(format);
+        if (data)
         {
-            auto p = static_cast<const BYTE *>(GlobalLock(data));
-            if (p)
+            size_t bytes = GlobalSize(data);
+            const size_t limit = format == CF_UNICODETEXT ? 256 * 1024 : ImageLimit;
+            if (bytes && bytes <= limit)
             {
-                if (format == CF_UNICODETEXT)
+                auto p = static_cast<const BYTE *>(GlobalLock(data));
+                if (p)
                 {
-                    auto text = reinterpret_cast<const wchar_t *>(p);
-                    size_t n = 0;
-                    while (n < bytes / sizeof(wchar_t) && text[n])
-                        ++n;
-                    if (n && n < bytes / sizeof(wchar_t))
+                    if (format == CF_UNICODETEXT)
                     {
-                        entry->label.assign(text, n);
-                        entry->data.assign(p, p + (n + 1) * sizeof(wchar_t));
+                        auto text = reinterpret_cast<const wchar_t *>(p);
+                        size_t n = 0;
+                        while (n < bytes / sizeof(wchar_t) && text[n])
+                            ++n;
+                        if (n && n < bytes / sizeof(wchar_t))
+                        {
+                            entry->label.assign(text, n);
+                            entry->data.assign(p, p + (n + 1) * sizeof(wchar_t));
+                        }
                     }
+                    else
+                    {
+                        // Preserve the original clipboard payload, including palettes and alpha.
+                        entry->data.assign(p, p + bytes);
+                        entry->source = clipboardSource();
+                        imageDimensions(*entry);
+                        const auto dimensions = entry->width && entry->height
+                                                    ? std::to_wstring(entry->width) + L" x " +
+                                                          std::to_wstring(entry->height) + L" px"
+                                                    : L"Unknown dimensions";
+                        entry->label = L"[Image] " + entry->source + L" | " + dimensions + L" | " +
+                                       std::to_wstring((bytes + 1023) / 1024) + L" KiB";
+                    }
+                    GlobalUnlock(data);
                 }
-                else
-                {
-                    // Preserve the original clipboard payload, including palettes and alpha.
-                    entry->data.assign(p, p + bytes);
-                    entry->source = clipboardSource();
-                    imageDimensions(*entry);
-                    const auto dimensions = entry->width && entry->height
-                                                ? std::to_wstring(entry->width) + L" x " +
-                                                      std::to_wstring(entry->height) + L" px"
-                                                : L"Unknown dimensions";
-                    entry->label = L"[Image] " + entry->source + L" | " + dimensions + L" | " +
-                                   std::to_wstring((bytes + 1023) / 1024) + L" KiB";
-                }
-                GlobalUnlock(data);
             }
         }
+        if (!entry->data.empty())
+            break;
     }
     CloseClipboard();
     if (entry->data.empty())
