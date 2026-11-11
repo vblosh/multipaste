@@ -3,12 +3,100 @@
 #include <deque>
 #include <string>
 #include <algorithm>
+#include <memory>
+#include <vector>
 
 constexpr UINT Tray = WM_APP + 1;
 HWND window, searchBox, listBox, previous;
-std::deque<std::wstring> history;
-std::deque<size_t> visible;
-std::wstring own;
+struct Entry
+{
+    UINT format = CF_UNICODETEXT;
+    std::vector<BYTE> data;
+    std::wstring label;
+    std::wstring source;
+    unsigned width = 0, height = 0;
+};
+using Item = std::shared_ptr<const Entry>;
+std::deque<Item> history;
+// Shared immutable snapshots remain valid when live history changes.
+std::deque<Item> visible;
+DWORD ownSequence = 0;
+constexpr size_t HistoryLimit = 32 * 1024 * 1024;
+constexpr size_t ImageLimit = 16 * 1024 * 1024;
+UINT pngFormat;
+
+std::wstring clipboardSource()
+{
+    DWORD pid = 0;
+    GetWindowThreadProcessId(GetClipboardOwner(), &pid);
+    HANDLE process = pid ? OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid) : nullptr;
+    if (!process)
+        return L"Unknown app";
+    wchar_t path[32768]{};
+    DWORD length = ARRAYSIZE(path);
+    const BOOL found = QueryFullProcessImageNameW(process, 0, path, &length);
+    CloseHandle(process);
+    if (!found)
+        return L"Unknown app";
+    std::wstring name(path, length);
+    auto slash = name.find_last_of(L"\\/");
+    if (slash != std::wstring::npos)
+        name.erase(0, slash + 1);
+    if (name.size() > 4 && _wcsicmp(name.c_str() + name.size() - 4, L".exe") == 0)
+        name.resize(name.size() - 4);
+    return name.empty() ? L"Unknown app" : name;
+}
+
+void imageDimensions(Entry &entry)
+{
+    const auto &data = entry.data;
+    if (entry.format == pngFormat)
+    {
+        const BYTE signature[] = {137, 80, 78, 71, 13, 10, 26, 10};
+        if (data.size() < 24 || memcmp(data.data(), signature, 8) != 0 ||
+            memcmp(data.data() + 8, "\0\0\0\rIHDR", 8) != 0)
+            return;
+        auto bigEndian = [&](size_t offset) {
+            return (unsigned(data[offset]) << 24) | (unsigned(data[offset + 1]) << 16) |
+                   (unsigned(data[offset + 2]) << 8) | unsigned(data[offset + 3]);
+        };
+        const unsigned width = bigEndian(16), height = bigEndian(20);
+        if (width && height && width <= INT_MAX && height <= INT_MAX)
+        {
+            entry.width = width;
+            entry.height = height;
+        }
+        return;
+    }
+    if (data.size() < sizeof(DWORD))
+        return;
+    DWORD headerSize;
+    memcpy(&headerSize, data.data(), sizeof(headerSize));
+    if (headerSize > data.size())
+        return;
+    if (headerSize == sizeof(BITMAPCOREHEADER) && data.size() >= sizeof(BITMAPCOREHEADER))
+    {
+        BITMAPCOREHEADER header{};
+        memcpy(&header, data.data(), sizeof(header));
+        if (header.bcWidth && header.bcHeight)
+        {
+            entry.width = header.bcWidth;
+            entry.height = header.bcHeight;
+        }
+    }
+    else if (headerSize >= sizeof(BITMAPINFOHEADER) && data.size() >= sizeof(BITMAPINFOHEADER))
+    {
+        BITMAPINFOHEADER header{};
+        memcpy(&header, data.data(), sizeof(header));
+        if (header.biWidth > 0 && header.biHeight && header.biHeight != LONG_MIN)
+        {
+            entry.width = static_cast<unsigned>(header.biWidth);
+            entry.height =
+                static_cast<unsigned>(header.biHeight < 0 ? -header.biHeight : header.biHeight);
+        }
+    }
+}
+
 NOTIFYICONDATAW tray{};
 bool pendingPaste = false;
 void refresh()
@@ -20,14 +108,14 @@ void refresh()
     for (size_t i = 0; i < history.size(); ++i)
     {
         if (*query &&
-            FindStringOrdinal(FIND_FROMSTART, history[i].c_str(), -1, query, -1, TRUE) < 0)
+            FindStringOrdinal(FIND_FROMSTART, history[i]->label.c_str(), -1, query, -1, TRUE) < 0)
             continue;
-        auto preview = history[i].substr(0, 160);
+        auto preview = history[i]->label.substr(0, 160);
         for (auto &c : preview)
             if (c == L'\r' || c == L'\n' || c == L'\t')
                 c = L' ';
         SendMessageW(listBox, LB_ADDSTRING, 0, reinterpret_cast<LPARAM>(preview.c_str()));
-        visible.push_back(i);
+        visible.push_back(history[i]);
     }
     if (!visible.empty())
         SendMessageW(listBox, LB_SETCURSEL, 0, 0);
@@ -40,43 +128,79 @@ void capture()
         return;
     }
     KillTimer(window, 2);
-    HANDLE data = GetClipboardData(CF_UNICODETEXT);
+    const DWORD sequence = GetClipboardSequenceNumber();
+    if (ownSequence && sequence == ownSequence)
+    {
+        CloseClipboard();
+        return;
+    }
+    ownSequence = 0;
+    // Prefer an image when a copy operation also advertises descriptive text.
+    UINT format = IsClipboardFormatAvailable(CF_DIBV5)                 ? CF_DIBV5
+                  : IsClipboardFormatAvailable(CF_DIB)                 ? CF_DIB
+                  : pngFormat && IsClipboardFormatAvailable(pngFormat) ? pngFormat
+                                                                       : CF_UNICODETEXT;
+    HANDLE data = GetClipboardData(format);
+    auto entry = std::make_shared<Entry>();
+    entry->format = format;
     if (data)
     {
         size_t bytes = GlobalSize(data);
-        if (bytes && bytes <= 256 * 1024)
+        const size_t limit = format == CF_UNICODETEXT ? 256 * 1024 : ImageLimit;
+        if (bytes && bytes <= limit)
         {
-            auto p = static_cast<const wchar_t *>(GlobalLock(data));
+            auto p = static_cast<const BYTE *>(GlobalLock(data));
             if (p)
             {
-                size_t n = 0;
-                while (n < bytes / 2 && p[n])
-                    ++n;
-                if (n < bytes / 2 && n)
+                if (format == CF_UNICODETEXT)
                 {
-                    std::wstring text(p, n);
-                    if (text != own)
+                    auto text = reinterpret_cast<const wchar_t *>(p);
+                    size_t n = 0;
+                    while (n < bytes / sizeof(wchar_t) && text[n])
+                        ++n;
+                    if (n && n < bytes / sizeof(wchar_t))
                     {
-                        history.erase(std::remove(history.begin(), history.end(), text),
-                                      history.end());
-                        history.push_front(text);
-                        size_t total = 0;
-                        for (auto &s : history)
-                            total += s.size() * 2;
-                        while (history.size() > 50 || total > 4 * 1024 * 1024)
-                        {
-                            total -= history.back().size() * 2;
-                            history.pop_back();
-                        }
+                        entry->label.assign(text, n);
+                        entry->data.assign(p, p + (n + 1) * sizeof(wchar_t));
                     }
-                    own.clear();
+                }
+                else
+                {
+                    // Preserve the original clipboard payload, including palettes and alpha.
+                    entry->data.assign(p, p + bytes);
+                    entry->source = clipboardSource();
+                    imageDimensions(*entry);
+                    const auto dimensions = entry->width && entry->height
+                                                ? std::to_wstring(entry->width) + L" x " +
+                                                      std::to_wstring(entry->height) + L" px"
+                                                : L"Unknown dimensions";
+                    entry->label = L"[Image] " + entry->source + L" | " + dimensions + L" | " +
+                                   std::to_wstring((bytes + 1023) / 1024) + L" KiB";
                 }
                 GlobalUnlock(data);
             }
         }
     }
     CloseClipboard();
+    if (entry->data.empty())
+        return;
+    history.erase(std::remove_if(history.begin(), history.end(),
+                                 [&](const Item &item) {
+                                     return item->format == entry->format &&
+                                            item->data == entry->data;
+                                 }),
+                  history.end());
+    history.push_front(entry);
+    size_t total = 0;
+    for (const auto &item : history)
+        total += item->data.size();
+    while (history.size() > 50 || total > HistoryLimit)
+    {
+        total -= history.back()->data.size();
+        history.pop_back();
+    }
 }
+
 void show()
 {
     previous = GetForegroundWindow();
@@ -99,10 +223,10 @@ void paste()
     LRESULT n = SendMessageW(listBox, LB_GETCURSEL, 0, 0);
     if (n < 0 || size_t(n) >= visible.size())
         return;
-    auto text = history[visible[n]];
+    auto item = visible[n];
     if (!OpenClipboard(window))
         return;
-    HGLOBAL mem = GlobalAlloc(GMEM_MOVEABLE, (text.size() + 1) * 2);
+    HGLOBAL mem = GlobalAlloc(GMEM_MOVEABLE, item->data.size());
     if (!mem)
     {
         CloseClipboard();
@@ -115,13 +239,15 @@ void paste()
         CloseClipboard();
         return;
     }
-    memcpy(p, text.c_str(), (text.size() + 1) * 2);
+    memcpy(p, item->data.data(), item->data.size());
     GlobalUnlock(mem);
-    EmptyClipboard();
-    if (!SetClipboardData(CF_UNICODETEXT, mem))
+    if (!EmptyClipboard() || !SetClipboardData(item->format, mem))
+    {
         GlobalFree(mem);
-    else
-        own = text;
+        CloseClipboard();
+        return;
+    }
+    ownSequence = GetClipboardSequenceNumber();
     CloseClipboard();
     ShowWindow(window, SW_HIDE);
     if (IsWindow(previous) && SetForegroundWindow(previous))
@@ -163,7 +289,6 @@ LRESULT CALLBACK proc(HWND h, UINT m, WPARAM w, LPARAM l)
         {
             KillTimer(h, 2);
             capture();
-            KillTimer(h, 2);
         }
         if (w == 3 && pendingPaste && !(GetAsyncKeyState(VK_CONTROL) & 0x8000) &&
             !(GetAsyncKeyState(VK_SHIFT) & 0x8000) && !(GetAsyncKeyState('V') & 0x8000))
@@ -209,7 +334,7 @@ LRESULT CALLBACK proc(HWND h, UINT m, WPARAM w, LPARAM l)
             if (cmd == 11)
             {
                 history.clear();
-                own.clear();
+                ownSequence = 0;
                 refresh();
             }
             if (cmd == 12)
@@ -235,10 +360,12 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int)
     HANDLE mutex = CreateMutexW(nullptr, FALSE, L"Local\\MultiPaste.Singleton");
     if (!mutex || GetLastError() == ERROR_ALREADY_EXISTS)
         return 0;
+    pngFormat = RegisterClipboardFormatW(L"PNG");
     SetProcessDPIAware();
     WNDCLASSW wc{};
     wc.lpfnWndProc = proc;
     wc.hInstance = instance;
+    wc.hIcon = LoadIconW(instance, MAKEINTRESOURCEW(101));
     wc.lpszClassName = L"MultiPaste";
     wc.hCursor = LoadCursor(nullptr, IDC_ARROW);
     wc.hbrBackground = (HBRUSH)(COLOR_WINDOW + 1);
@@ -251,7 +378,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int)
     tray.uID = 1;
     tray.uFlags = NIF_ICON | NIF_MESSAGE | NIF_TIP;
     tray.uCallbackMessage = Tray;
-    tray.hIcon = LoadIcon(nullptr, IDI_APPLICATION);
+    tray.hIcon = wc.hIcon;
     lstrcpyW(tray.szTip, L"MultiPaste - Ctrl+Shift+V");
     Shell_NotifyIconW(NIM_ADD, &tray);
     AddClipboardFormatListener(window);

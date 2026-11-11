@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.20)
-project(MultiPaste LANGUAGES CXX)
-add_executable(MultiPaste WIN32 main.cpp)
+project(MultiPaste LANGUAGES CXX RC)
+add_executable(MultiPaste WIN32 main.cpp app.rc)
 target_compile_features(MultiPaste PRIVATE cxx_std_17)
 target_compile_definitions(MultiPaste PRIVATE UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX)
 target_link_libraries(MultiPaste PRIVATE user32 shell32)
